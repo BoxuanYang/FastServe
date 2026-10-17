@@ -4,7 +4,13 @@ from typing import List, Union, Optional
 import asyncio
 from tqdm import tqdm
 
-from fastserve.config import ModelConfig, ParallelConfig, CacheConfig, SchedConfig
+from fastserve.config import (
+    ModelConfig,
+    ParallelConfig,
+    CacheConfig,
+    SchedConfig,
+    validate_glm_runtime_config,
+)
 from fastserve.engine import LLMEngine
 from fastserve.logger import init_logger
 from fastserve.request import Request, SamplingParams
@@ -42,6 +48,12 @@ class OfflineLLM:
         num_min_free_blocks_threshold: int = 0,
         num_queues_for_prediction: int = 2,
         use_skip_join: bool = True,
+        dtype: str = "fp16",
+        kt_weight_path: Optional[str] = None,
+        kt_cpuinfer: int = 128,
+        kt_threadpool_count: int = 2,
+        kt_method: str = "LLAMAFILE",
+        kt_chunked_prefill_size: int = 4096,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -49,8 +61,14 @@ class OfflineLLM:
             model,
             tokenizer,
             trust_remote_code=trust_remote_code,
+            dtype=dtype,
             seed=seed,
             use_dummy_weights=use_dummy_weights,
+            kt_weight_path=kt_weight_path,
+            kt_cpuinfer=kt_cpuinfer,
+            kt_threadpool_count=kt_threadpool_count,
+            kt_method=kt_method,
+            kt_chunked_prefill_size=kt_chunked_prefill_size,
         )
         self.parallel_config = ParallelConfig(
             pipeline_parallel_size=pipeline_parallel_size,
@@ -58,6 +76,9 @@ class OfflineLLM:
         )
         self.cache_config = CacheConfig(
             block_size, max_num_blocks_per_req, gpu_memory_utilization, swap_space
+        )
+        validate_glm_runtime_config(
+            self.model_config, self.cache_config, self.parallel_config
         )
         self.sched_config = SchedConfig(
             sched_policy,
@@ -161,6 +182,12 @@ class AsyncLLM:
         num_min_free_blocks_threshold: int = 0,
         num_queues_for_prediction: int = 2,
         use_skip_join: bool = True,
+        dtype: str = "fp16",
+        kt_weight_path: Optional[str] = None,
+        kt_cpuinfer: int = 128,
+        kt_threadpool_count: int = 2,
+        kt_method: str = "LLAMAFILE",
+        kt_chunked_prefill_size: int = 4096,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -168,8 +195,14 @@ class AsyncLLM:
             model,
             tokenizer,
             trust_remote_code=trust_remote_code,
+            dtype=dtype,
             seed=seed,
             use_dummy_weights=use_dummy_weights,
+            kt_weight_path=kt_weight_path,
+            kt_cpuinfer=kt_cpuinfer,
+            kt_threadpool_count=kt_threadpool_count,
+            kt_method=kt_method,
+            kt_chunked_prefill_size=kt_chunked_prefill_size,
         )
         self.parallel_config = ParallelConfig(
             pipeline_parallel_size=pipeline_parallel_size,
@@ -177,6 +210,9 @@ class AsyncLLM:
         )
         self.cache_config = CacheConfig(
             block_size, max_num_blocks_per_req, gpu_memory_utilization, swap_space
+        )
+        validate_glm_runtime_config(
+            self.model_config, self.cache_config, self.parallel_config
         )
         self.sched_config = SchedConfig(
             sched_policy,

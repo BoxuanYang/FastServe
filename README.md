@@ -18,6 +18,7 @@ It is scalable with:
 It currently supports:
 - OPT (facebook/opt-1.3b, facebook/opt-6.7b, ...)
 - LLaMA2 (meta-llama/Llama-2-7b, meta-llama/Llama-2-13b, ...)
+- GLM-4.5-Air with sharded GGUF weights and KTransformers MoE execution
 
 ## Build && Install
 
@@ -54,6 +55,14 @@ python -m fastserve.api_server.fastserve_api_server
 # launch client
 python fastserve/examples/online.py
 ```
+
+### GLM-4.5-Air (GGUF)
+
+GLM-4.5-Air uses the same FlashInfer attention contract as FlashKVMoE and
+offloads routed experts through the pinned KTransformers `kt-kernel`. This path
+is GGUF-only and requires BF16, one GPU, and KV-cache block size 1. See
+[doc/glm4_air.md](./doc/glm4_air.md) for the pinned dependency build, checkpoint
+layout, parity details, and a complete server command.
 
 ## Contribution
 If you want to contribute to the project, please read [contribution.md](./contribution.md).

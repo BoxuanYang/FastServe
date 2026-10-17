@@ -117,30 +117,47 @@ class ParaWorker:
         if self.model_config.use_dummy_weights:
             self.model.init_dummy_weights()
         else:
-            path = download_and_convert_weights(self.model_config)
-            self.model.load_weight(path)
+            if self.model_config.is_glm4_moe:
+                self.model.load_weight(self.model_config.kt_weight_path)
+            else:
+                path = download_and_convert_weights(self.model_config)
+                self.model.load_weight(path)
         torch.cuda.synchronize()
         logger.info(f"model {self.model_config.model} loaded")
 
     def init_kvcache_and_swap(self, num_gpu_blocks, num_cpu_blocks):
-        # kv shape is [num_gpu_blocks, num_layers, num_local_heads, block_size, head_dim]
-        # profile the GPU to get num_gpu_blocks
-        kv_cache_shape = (
-            num_gpu_blocks,
-            self.model_config.get_num_layers(self.parallel_config),
-            self.model_config.get_num_heads(self.parallel_config),
-            self.cache_config.block_size,
-            self.model_config.get_head_size(),
-        )
+        if self.model_config.is_glm4_moe:
+            # Each layer slice is a contiguous FlashInfer NHD paged cache.
+            kv_cache_shape = (
+                self.model_config.get_num_layers(self.parallel_config),
+                num_gpu_blocks,
+                self.cache_config.block_size,
+                self.model_config.get_num_heads(self.parallel_config),
+                self.model_config.get_head_size(),
+            )
+            kv_swap_shape = (
+                self.model_config.get_num_layers(self.parallel_config),
+                num_cpu_blocks,
+            ) + kv_cache_shape[2:]
+        else:
+            # kv shape is [num_gpu_blocks, num_layers, num_local_heads, block_size, head_dim]
+            # profile the GPU to get num_gpu_blocks
+            kv_cache_shape = (
+                num_gpu_blocks,
+                self.model_config.get_num_layers(self.parallel_config),
+                self.model_config.get_num_heads(self.parallel_config),
+                self.cache_config.block_size,
+                self.model_config.get_head_size(),
+            )
+            # kv swap is [num_cpu_blocks, num_layers, num_local_heads, block_size, head_dim]
+            kv_swap_shape = (num_cpu_blocks,) + kv_cache_shape[1:]
         self.k_cache = torch.empty(
             kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
         )
         self.v_cache = torch.empty(
             kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
         )
-        # kv swap is [num_cpu_blocks, num_layers, num_local_heads, block_size, head_dim]
         # We pin memory here in order to leverage cudaMemcpyAsync when swapping
-        kv_swap_shape = (num_cpu_blocks,) + kv_cache_shape[1:]
         self.k_swap = torch.empty(
             kv_swap_shape, dtype=self.model_config.get_torch_dtype(), device="cpu", pin_memory=True
         )
@@ -176,13 +193,20 @@ class ParaWorker:
 
         # Profile memory usage with max_batch_size requests and the total
         # number of tokens equal to max_tokens_per_batch.
-        total_gpu_memory = get_gpu_memory()
-        peak_runtime_memory = (
-            total_gpu_memory * 0.01
-            + self.model_config.get_model_size_in_bytes(
-                parallel_config=self.parallel_config
+        if self.model_config.is_glm4_moe:
+            torch.cuda.synchronize()
+            free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+            peak_runtime_memory = (
+                total_gpu_memory - free_gpu_memory + total_gpu_memory * 0.01
             )
-        )
+        else:
+            total_gpu_memory = get_gpu_memory()
+            peak_runtime_memory = (
+                total_gpu_memory * 0.01
+                + self.model_config.get_model_size_in_bytes(
+                    parallel_config=self.parallel_config
+                )
+            )
         logger.info(f"runtime peak memory: {peak_runtime_memory / GB:.3f} GB")
         logger.info(f"total GPU memory: {total_gpu_memory / GB:.3f} GB")
         block_size_in_bytes = self._get_block_size_in_bytes(
@@ -212,6 +236,8 @@ class ParaWorker:
         input_tokens_batched,
         first_token_indexes,
         block_table,
+        is_context_stage_batched=None,
+        sampling_params=None,
     ) -> Tuple[Optional[List[int]], int]:
         """Run one step of inference on the batch of requests."""
 
@@ -228,13 +254,24 @@ class ParaWorker:
 
         start = time.time()
         # run forward
-        generated_tokens_ids = self.model.forward(
-            input_tokens_batched,
-            first_token_indexes,
-            self.k_cache,
-            self.v_cache,
-            block_table,
-        )
+        if self.model_config.is_glm4_moe:
+            generated_tokens_ids = self.model.forward(
+                input_tokens_batched,
+                first_token_indexes,
+                is_context_stage_batched,
+                self.k_cache,
+                self.v_cache,
+                block_table,
+                sampling_params,
+            )
+        else:
+            generated_tokens_ids = self.model.forward(
+                input_tokens_batched,
+                first_token_indexes,
+                self.k_cache,
+                self.v_cache,
+                block_table,
+            )
         self.execution_time += time.time() - start
 
         return generated_tokens_ids
@@ -251,6 +288,14 @@ class ParaWorker:
         #source_block_ids[0] will be copied to GPU block #target_block_ids[0]
         and so on. Similar for is_swap_in = False
         """
+
+        if self.model_config.is_glm4_moe:
+            return self._swap_glm_blocks(
+                request_ids,
+                source_block_ids,
+                target_block_ids,
+                is_swap_in,
+            )
 
         # print(f"Swap {source_block_ids} ({'CPU' if is_swap_in else 'GPU'}) to {target_block_ids} ({'GPU' if is_swap_in else 'CPU'})")
         stream = self.swap_in_stream if is_swap_in else self.swap_out_stream
@@ -282,6 +327,46 @@ class ParaWorker:
                 self.k_swap,
                 self.v_swap,
             )
+
+    def _swap_glm_blocks(
+        self,
+        requests,
+        source_block_ids: List[int],
+        target_block_ids: List[int],
+        is_swap_in: bool,
+    ):
+        """Apply FastServe's swap plan to the GLM cache page dimension."""
+        stream = self.swap_in_stream if is_swap_in else self.swap_out_stream
+        request_ids = [
+            request.request_id if isinstance(request, Request) else request
+            for request in requests
+        ]
+
+        for request_id in request_ids:
+            if request_id in self.swap_event_table:
+                self.swap_event_table[request_id].wait(stream)
+
+        source_k = self.k_swap if is_swap_in else self.k_cache
+        source_v = self.v_swap if is_swap_in else self.v_cache
+        target_k = self.k_cache if is_swap_in else self.k_swap
+        target_v = self.v_cache if is_swap_in else self.v_swap
+        with torch.cuda.stream(stream):
+            for source_id, target_id in zip(source_block_ids, target_block_ids):
+                target_k[:, target_id].copy_(
+                    source_k[:, source_id], non_blocking=True
+                )
+                target_v[:, target_id].copy_(
+                    source_v[:, source_id], non_blocking=True
+                )
+
+        event = torch.cuda.Event()
+        event.record(stream)
+        for request_id in request_ids:
+            self.swap_event_table[request_id] = event
+        if is_swap_in:
+            self.latest_swap_in_event = event
+        else:
+            self.latest_swap_out_event = event
 
     def clear_request_resource(self, request_id: int):
         """Clear the resources associated with the request."""

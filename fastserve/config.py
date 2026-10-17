@@ -116,7 +116,11 @@ class SchedConfig:
         self.use_skip_join = use_skip_join
 
 
-_TORCH_DTYPE_MAP = {"fp16": torch.half, "fp32": torch.float32}
+_TORCH_DTYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.half,
+    "fp32": torch.float32,
+}
 
 
 class ModelConfig:
@@ -143,6 +147,11 @@ class ModelConfig:
         dtype: str = "fp16",
         seed: int = 1,
         use_dummy_weights: bool = False,
+        kt_weight_path: Optional[str] = None,
+        kt_cpuinfer: int = 128,
+        kt_threadpool_count: int = 2,
+        kt_method: str = "LLAMAFILE",
+        kt_chunked_prefill_size: int = 4096,
     ):
         self.model = model
         self.tokenizer = tokenizer if tokenizer else model
@@ -150,15 +159,41 @@ class ModelConfig:
         self.trust_remote_code = trust_remote_code
         self.dtype = dtype
         self.seed = seed
+        self.kt_weight_path = kt_weight_path
+        self.kt_cpuinfer = kt_cpuinfer
+        self.kt_threadpool_count = kt_threadpool_count
+        self.kt_method = kt_method
+        self.kt_chunked_prefill_size = kt_chunked_prefill_size
         self._verify_args()
         self.hf_config = self._get_hf_config()
         self.use_dummy_weights = use_dummy_weights
+        self._verify_glm_args()
 
     def _verify_args(self):
         assert self.dtype in [
+            "bf16",
             "fp16",
             "fp32",
-        ], f"dtype must be either 'fp16' or 'fp32'."
+        ], "dtype must be one of 'bf16', 'fp16', or 'fp32'."
+
+    def _verify_glm_args(self):
+        if not self.is_glm4_moe:
+            assert self.dtype != "bf16", "Legacy models do not support bf16."
+            return
+        if self.dtype != "bf16":
+            raise ValueError("GLM-4.5-Air requires dtype='bf16'")
+        if not self.kt_weight_path:
+            raise ValueError("GLM-4.5-Air requires GGUF weights via kt_weight_path")
+        if self.use_dummy_weights:
+            raise ValueError("GLM-4.5-Air only supports GGUF weights")
+        if self.kt_method != "LLAMAFILE":
+            raise ValueError("GLM-4.5-Air requires kt_method='LLAMAFILE'")
+        if self.kt_cpuinfer <= 0:
+            raise ValueError("kt_cpuinfer must be positive")
+        if not 0 < self.kt_threadpool_count <= self.kt_cpuinfer:
+            raise ValueError("kt_threadpool_count must be in [1, kt_cpuinfer]")
+        if self.kt_chunked_prefill_size <= 0:
+            raise ValueError("kt_chunked_prefill_size must be positive")
 
     def _get_hf_config(self):
         try:
@@ -171,8 +206,25 @@ class ModelConfig:
             )
         return config
 
+    @property
+    def text_config(self):
+        return getattr(self.hf_config, "text_config", None) or self.hf_config
+
+    @property
+    def model_type(self) -> str:
+        model_type = getattr(self.hf_config, "model_type", None)
+        nested_model_type = getattr(self.text_config, "model_type", None)
+        return "glm4_moe" if nested_model_type == "glm4_moe" else model_type
+
+    @property
+    def is_glm4_moe(self) -> bool:
+        return self.model_type == "glm4_moe"
+
+    def _architecture_config(self):
+        return self.text_config if self.is_glm4_moe else self.hf_config
+
     def get_dtype_size(self) -> int:
-        if self.dtype == "fp16":
+        if self.dtype in ("bf16", "fp16"):
             return 2
         elif self.dtype == "fp32":
             return 4
@@ -183,19 +235,24 @@ class ModelConfig:
         return _TORCH_DTYPE_MAP[self.dtype]
 
     def get_hidden_size(self) -> int:
-        return self.hf_config.hidden_size
+        return self._architecture_config().hidden_size
 
     def get_head_size(self) -> int:
-        return self.hf_config.hidden_size // self.hf_config.num_attention_heads
+        if not self.is_glm4_moe:
+            return self.hf_config.hidden_size // self.hf_config.num_attention_heads
+        config = self._architecture_config()
+        return getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
 
     def get_ffn_inter_dim(self) -> int:
         # For LLaMA-2:
-        return self.hf_config.intermediate_size
+        return self._architecture_config().intermediate_size
 
     def get_q_heads(self, parallel_config: ParallelConfig = ParallelConfig()) -> int:
         # For LLaMA-2:
         return (
-            self.hf_config.num_attention_heads
+            self._architecture_config().num_attention_heads
                 // parallel_config.tensor_parallel_size
         )
 
@@ -204,28 +261,29 @@ class ModelConfig:
         # Note: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of
         # KV heads.
-        new_decoder_arch_falcon = self.hf_config.model_type == "falcon" and getattr(
-            self.hf_config, "new_decoder_architecture", False
+        config = self._architecture_config()
+        new_decoder_arch_falcon = config.model_type == "falcon" and getattr(
+            config, "new_decoder_architecture", False
         )
         if not new_decoder_arch_falcon and getattr(
-            self.hf_config, "multi_query", False
+            config, "multi_query", False
         ):
             # Multi-query attention, only one KV head.
             return 1
 
         # For Falcon:
-        if getattr(self.hf_config, "n_head_kv", None) is not None:
-            return self.hf_config.n_head_kv // parallel_config.tensor_parallel_size
+        if getattr(config, "n_head_kv", None) is not None:
+            return config.n_head_kv // parallel_config.tensor_parallel_size
 
         # For LLaMA-2:
-        if getattr(self.hf_config, "num_key_value_heads", None) is not None:
+        if getattr(config, "num_key_value_heads", None) is not None:
             return (
-                self.hf_config.num_key_value_heads
+                config.num_key_value_heads
                 // parallel_config.tensor_parallel_size
             )
 
         # Normal case:
-        total_num_attention_heads = self.hf_config.num_attention_heads
+        total_num_attention_heads = config.num_attention_heads
         assert total_num_attention_heads % parallel_config.tensor_parallel_size == 0, (
             f"Total number of attention heads ({total_num_attention_heads}) "
             f"must be divisible by the size of tensor parallel group "
@@ -248,13 +306,13 @@ class ModelConfig:
             "seq_len",
         ]
         for key in possible_keys:
-            max_len_key = getattr(self.hf_config, key, None)
+            max_len_key = getattr(self._architecture_config(), key, None)
             if max_len_key is not None:
                 max_model_len = min(max_model_len, max_len_key)
         return max_model_len
 
     def get_num_layers(self, parallel_config: ParallelConfig = ParallelConfig()) -> int:
-        total_num_hidden_layers = self.hf_config.num_hidden_layers
+        total_num_hidden_layers = self._architecture_config().num_hidden_layers
         assert total_num_hidden_layers % parallel_config.pipeline_parallel_size == 0, (
             f"Number of layers ({total_num_hidden_layers}) must be divisible "
             f"by the size of pipeline parallel group "
@@ -279,3 +337,22 @@ class ModelConfig:
             + 5 * self.get_num_layers(parallel_config) * self.get_hidden_size()  # bias
         ) 
         return total_params * self.get_dtype_size()
+
+
+def validate_glm_runtime_config(
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
+    parallel_config: ParallelConfig,
+) -> None:
+    """Validate only the execution constraints imposed by the GLM backend."""
+    if not model_config.is_glm4_moe:
+        return
+    if cache_config.block_size != 1:
+        raise ValueError(
+            "GLM-4.5-Air requires block_size=1 for FlashInfer page_size=1"
+        )
+    if (
+        parallel_config.tensor_parallel_size != 1
+        or parallel_config.pipeline_parallel_size != 1
+    ):
+        raise ValueError("GLM-4.5-Air KTransformers support is single-GPU only")

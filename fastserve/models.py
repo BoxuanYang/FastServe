@@ -9,7 +9,15 @@ def get_model_op(
     cache_config: CacheConfig,
 ):
     model_name = model_config.model
-    model_type = model_config.hf_config.model_type
+    model_type = model_config.model_type
+    if model_config.is_glm4_moe:
+        from fastserve.glm4_moe.runner import Glm4MoeOp
+
+        return Glm4MoeOp(model_config, parallel_config, cache_config)
+
+    from fastserve import load_swift_transformer
+
+    load_swift_transformer()
     match model_type:
       case 'opt':
         return torch.classes.gpt_ops.OptOp(

@@ -1,0 +1,36 @@
+name: fastserve-glm
+channels:
+  - nvidia/label/cuda-12.8.1
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - git
+  - "cmake<4"
+  - ninja
+  - make
+  - pkg-config
+  - libhwloc
+  - libnuma
+  - gcc_linux-64=13
+  - gxx_linux-64=13
+  - cuda-toolkit=12.8.1
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.9.1+cu128
+      - flashinfer-python>=0.5.3
+      - gguf>=0.17.0
+      - apache-tvm-ffi>=0.1.4
+      - transformers>=4.56.0,<=4.57.3
+      - ray==2.40.0
+      - fastapi==0.115.6
+      - uvicorn==0.34.0
+      - huggingface-hub>=0.34.0,<1.0
+      - ninja>=1.11
+      - numpy>=2.0
+      - psutil>=6.1
+      - requests>=2.32
+      - tqdm>=4.66
+      - filelock>=3.13
+      - pybind11>=2.13
+      - pytest>=8.0

@@ -78,6 +78,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="facebook/opt-1.3b")
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--dtype", type=str, choices=["bf16", "fp16", "fp32"], default="fp16"
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -94,6 +97,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-min-free-blocks-threshold", type=int, default=0)
     parser.add_argument("--num-queues-for-prediction", type=int, default=2)
     parser.add_argument("--use-skip-join", action="store_true")
+    parser.add_argument("--kt-weight-path", type=str, default=None)
+    parser.add_argument("--kt-cpuinfer", type=int, default=128)
+    parser.add_argument("--kt-threadpool-count", type=int, default=2)
+    parser.add_argument("--kt-method", type=str, default="LLAMAFILE")
+    parser.add_argument("--kt-chunked-prefill-size", type=int, default=4096)
     args = parser.parse_args()
 
     ray.init()
@@ -102,6 +110,7 @@ if __name__ == "__main__":
         args.model,
         tokenizer=args.tokenizer,
         trust_remote_code=args.trust_remote_code,
+        dtype=args.dtype,
         seed=args.seed,
         pipeline_parallel_size=args.pipeline_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
@@ -118,6 +127,11 @@ if __name__ == "__main__":
         num_min_free_blocks_threshold=args.num_min_free_blocks_threshold,
         num_queues_for_prediction=args.num_queues_for_prediction,
         use_skip_join=args.use_skip_join,
+        kt_weight_path=args.kt_weight_path,
+        kt_cpuinfer=args.kt_cpuinfer,
+        kt_threadpool_count=args.kt_threadpool_count,
+        kt_method=args.kt_method,
+        kt_chunked_prefill_size=args.kt_chunked_prefill_size,
     )
 
     uvicorn.run(

@@ -144,15 +144,24 @@ class LLMEngine:
         each worker will be assigned a GPU
         the worker will be placed in the corresponding placement group
         """
-        self.pp_id = ray.put(copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id()))
-        # wait until pp_id is ready
-        ray.get(self.pp_id)
+        if self.model_config.is_glm4_moe:
+            self.pp_id = None
+        else:
+            from fastserve import load_swift_transformer
+
+            load_swift_transformer()
+            self.pp_id = ray.put(copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id()))
+            # wait until pp_id is ready
+            ray.get(self.pp_id)
         init_handlers = []
         for i in range(self.parallel_config.pipeline_parallel_size):
             workers = []
-            tp_id = ray.put(copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id()))
-            # wait until tp_id is ready
-            ray.get(tp_id)
+            if self.model_config.is_glm4_moe:
+                tp_id = None
+            else:
+                tp_id = ray.put(copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id()))
+                # wait until tp_id is ready
+                ray.get(tp_id)
             for j in range(self.parallel_config.tensor_parallel_size):
                 tmp_parallel_config = copy.deepcopy(self.parallel_config)
                 tmp_parallel_config.pipeline_parallel_rank = i
@@ -266,15 +275,28 @@ class LLMEngine:
         # push the batch into pipeline
         batched_requests.start_one_iteration(time.time())
         self.batches_in_pipeline.append(batched_requests)
-        remote_calls = self.remote_call_all_workers_async(
-            "step",
-            batched_requests.get_request_ids(),
-            batched_requests.get_input_tokens_batched(),
-            batched_requests.get_first_token_indexes(),
-            self.block_manager.get_partial_block_table(
-                batched_requests.get_request_ids()
-            ),
-        )
+        if self.model_config.is_glm4_moe:
+            remote_calls = self.remote_call_all_workers_async(
+                "step",
+                batched_requests.get_request_ids(),
+                batched_requests.get_input_tokens_batched(),
+                batched_requests.get_first_token_indexes(),
+                self.block_manager.get_partial_block_table(
+                    batched_requests.get_request_ids()
+                ),
+                batched_requests.get_is_context_stage(),
+                [request.sampling_params for request in batched_requests.requests],
+            )
+        else:
+            remote_calls = self.remote_call_all_workers_async(
+                "step",
+                batched_requests.get_request_ids(),
+                batched_requests.get_input_tokens_batched(),
+                batched_requests.get_first_token_indexes(),
+                self.block_manager.get_partial_block_table(
+                    batched_requests.get_request_ids()
+                ),
+            )
         # only the leader of the last stage return valid output, i.e., generated tokens ids
         self.batches_ret_futures.append(remote_calls[(pp_size - 1) * tp_size])
 
